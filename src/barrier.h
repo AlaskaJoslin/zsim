@@ -49,7 +49,7 @@
 #include "locks.h"
 #include "log.h"
 #include "mtrand.h"
-
+#include "zsim.h"
 // Configure futex timeouts (die rather than deadlock)
 #define TIMEOUT_LENGTH 20 //seconds
 #define MAX_TIMEOUTS 10
@@ -84,6 +84,7 @@ class Barrier : public GlobAlloc {
 
         uint32_t runningThreads; //threads in RUNNING state
         uint32_t leftThreads; //threads in LEFT state
+        uint32_t sleepingThreads; //threads sleeping on syscall
         //Threads in OFFLINE state are not on the runlist, so runListSize - runningThreads - leftThreads == waitingThreads
 
         uint32_t phaseCount; //INTERNAL, for LEFT->OFFLINE bookkeeping overhead reduction purposes
@@ -114,11 +115,22 @@ class Barrier : public GlobAlloc {
 
             runningThreads = 0;
             leftThreads = 0;
+            sleepingThreads = 0;
             phaseCount = 0;
             //barrierLock = 0;
         }
 
         ~Barrier() {}
+        int notAtBarrier() {
+            //returns the number of threads not at the barrier.
+            int threadsAt = 0;
+            for (uint32_t i = runListSize; i > 0; i--) {
+                if ((threadList[i].futexWord == 1 && threadList[i].state == WAITING) || threadList[i].state == LEFT) {
+                    threadsAt++;
+                }
+            }
+            return runListSize - threadsAt;
+        }
 
         //Called with schedLock held; returns with schedLock unheld
         void join(uint32_t tid, lock_t* schedLock) {
@@ -144,22 +156,28 @@ class Barrier : public GlobAlloc {
                     //now we'll be scheduled next :)
                 }
             }
-
-
             threadList[tid].state = WAITING;
             threadList[tid].futexWord = 1;
+            for (uint32_t i = runListSize; i > 0; i--) {
+                if (!((threadList[i].futexWord == 1 && threadList[i].state == WAITING) || threadList[i].state == LEFT)) {
+                    info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!TID %u is still running", i);
+                }
+            }
+            info("TID %d is about try to wake next, running threads is %d", tid, runningThreads);
             tryWakeNext(tid); //NOTE: You can't cause a phase to end here.
             futex_unlock(schedLock);
 
             if (threadList[tid].state == WAITING) {
                 DEBUG_BARRIER("[%d] Waiting on join", tid);
+                info("[%d] looping in join", tid);
                 while (true) {
                     int futex_res = syscall(SYS_futex, &threadList[tid].futexWord, FUTEX_WAIT, 1 /*a racing thread waking us up will change value to 0, and we won't block*/, nullptr, nullptr, 0);
                     if (futex_res == 0 || threadList[tid].futexWord != 1) break;
                 }
                 //The thread that wakes us up changes this
-                assert(threadList[tid].state == RUNNING);
+                // assert(threadList[tid].state == RUNNING);
             }
+            assert(threadList[tid].state == RUNNING);
         }
 
         //Must be called with schedLock held
@@ -174,6 +192,7 @@ class Barrier : public GlobAlloc {
                 assert_msg(threadList[tid].state == WAITING, "leave, tid %d, incorrect state %d", tid, threadList[tid].state);
                 threadList[tid].state = LEFT;
                 leftThreads++;
+                warn("!!!!!!!!!!!!!!!!!!!!!Should we have decreased runningThreads");
             }
         }
 
@@ -184,10 +203,16 @@ class Barrier : public GlobAlloc {
             threadList[tid].futexWord = 1;
             threadList[tid].state = WAITING;
             runningThreads--;
+            info("TID %d is about try to wake next, running threads is %d", tid, runningThreads);
+            for (uint32_t i = runListSize; i > 0; i--) {
+                if (!((threadList[i].futexWord == 1 && threadList[i].state == WAITING) || threadList[i].state == LEFT)) {
+                    info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!TID %u is still running", i);
+                }
+            }
             tryWakeNext(tid); //can trigger phase end
             futex_unlock(schedLock);
-
             if (threadList[tid].state == WAITING) {
+                info("looping in sync %d", tid);
                 while (true) {
                     int futex_res = syscall(SYS_futex, &threadList[tid].futexWord, FUTEX_WAIT, 1 /*a racing thread waking us up will change value to 0, and we won't block*/, nullptr, nullptr, 0);
                     if (futex_res == 0 || threadList[tid].futexWord != 1) break;
@@ -199,8 +224,10 @@ class Barrier : public GlobAlloc {
 
     private:
         inline void checkEndPhase(uint32_t tid) {
+            // info("Check End Phase Barrier: Cur Thread: %d Run List Size %d Running Threads %d", curThreadIdx, runListSize, runningThreads);
             if (curThreadIdx == runListSize && runningThreads == 0) {
                 if (leftThreads == runListSize) {
+                    info("[%d] All threads left barrier, not ending current phase", tid);
                     DEBUG_BARRIER("[%d] All threads left barrier, not ending current phase", tid);
                     return; //watch the early return
                 }
@@ -223,13 +250,12 @@ class Barrier : public GlobAlloc {
                             uint32_t stid = runList[newSize-1];
                             runList[idx] = stid;
                             threadList[stid].lastIdx = idx;
-
                             newSize--; //last elem is now garbage
                         } else {
                             idx++; //this one is OK, keep going
                         }
                     }
-                    assert(runListSize - newSize == leftThreads);
+                    assert(runListSize - newSize == (leftThreads + sleepingThreads));
                     leftThreads = 0;
                     DEBUG_BARRIER("[%d] Cleanup pass, initial runListSize %d, now %d", tid, runListSize, newSize);
                     runListSize = newSize;
@@ -254,6 +280,7 @@ class Barrier : public GlobAlloc {
         }
 
         inline void checkRunList(uint32_t tid) {
+            // info("Looping in check run list %d running threads is currently %d", tid, runningThreads);
             while (runningThreads < parallelThreads && curThreadIdx < runListSize) {
                 //Wake next thread
                 uint32_t idx = curThreadIdx++;
@@ -265,12 +292,15 @@ class Barrier : public GlobAlloc {
                     bool succ = __sync_bool_compare_and_swap(&threadList[wtid].futexWord, 1, 0);
                     if (!succ) panic("Wakeup race in barrier?");
                     syscall(SYS_futex, &threadList[wtid].futexWord, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+                    // info("TID %u woke up %d threads in barrier", tid, woken);
                     runningThreads++;
                 } else {
+                    // info("!!!!!!!!!!!!!!!!!!!!!Thread TID %u was asleep", wtid);
                     DEBUG_BARRIER("[%d] Skipping %d state %d", tid, wtid, threadList[wtid].state);
                 }
             }
-        }
+            // info("Running Threads %d Parallel Threads %d Cur Thread IDX %d Run List Size %d", runningThreads, parallelThreads, curThreadIdx, runListSize);
+       }
 
         void tryWakeNext(uint32_t tid) {
             checkRunList(tid); //wake up threads on this phase, may reach EOP

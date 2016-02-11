@@ -32,6 +32,8 @@
 #include <list>
 #include <sstream>
 #include <vector>
+#include <deque>
+#include <map>
 #include "barrier.h"
 #include "constants.h"
 #include "core.h"
@@ -43,6 +45,7 @@
 #include "process_stats.h"
 #include "stats.h"
 #include "zsim.h"
+#include "virt/common.h"
 
 /**
  * TODO (dsm): This class is due for a heavy pass or rewrite. Some things are more complex than they should:
@@ -60,6 +63,28 @@
 /* Performs (pid, tid) -> cid translation; round-robin scheduling with no notion of locality or heterogeneity... */
 
 class Scheduler : public GlobAlloc, public Callee {
+    public:
+        struct FutexInfo {
+            int *uaddr;
+            int op;
+            int val;
+            struct timespec timeout;
+            uint32_t val2;
+            int *uaddr2;
+            int val3;
+            int retValue;
+        };
+
+        struct FutexWaiter {
+          uint32_t pid;
+          uint32_t tid;
+          int mask;
+          int val;
+          bool pi_waiter;
+          bool allow_requeue;
+          FutexInfo fi;
+        };
+
     private:
         enum ThreadState {
             STARTED, //transient state, thread will do a join immediately after
@@ -137,6 +162,8 @@ class Scheduler : public GlobAlloc, public Callee {
         g_unordered_map<uint32_t, ThreadInfo*> gidMap;
         g_vector<ContextInfo> contexts;
 
+        std::map<int *, std::deque<FutexWaiter>> futexTable;
+
         InList<ContextInfo> freeList;
 
         InList<ThreadInfo> runQueue;
@@ -182,9 +209,6 @@ class Scheduler : public GlobAlloc, public Callee {
             //nextVictim = 0; //only used when freeList is empty.
             curPhase = 0;
             scheduledThreads = 0;
-
-            maxAllowedFutexWakeups = 0;
-            unmatchedFutexWakeups = 0;
 
             blockingSyscalls.resize(MAX_THREADS /* TODO: max # procs */);
 
@@ -271,6 +295,39 @@ class Scheduler : public GlobAlloc, public Callee {
             futex_unlock(&schedLock);
         }
 
+        //This function should block until it is actually scheduled
+        uint32_t syscallJoin(uint32_t pid, uint32_t tid) {
+            futex_lock(&schedLock);
+            info("syscallJoin called on tid %d", tid);
+            uint32_t gid = getGid(pid, tid);
+            ThreadInfo* th = gidMap[gid];
+            assert(th->markedForSleep == false);
+            assert(th->state == SLEEPING);
+            sleepQueue.remove(th);
+            th->state = BLOCKED;
+            // If we're in a fake leave, something is wrong.
+            if (th->fakeLeave) {
+                panic("fake leave in join tid %d", tid);
+            }
+            ContextInfo* ctx = schedThread(th);
+            if (ctx) {
+                schedule(th, ctx);
+                info("SyscallJoin: Schedule successful");
+                zinfo->cores[th->cid]->join();
+                info("SyscallJoin: Core Join successful");
+                bar.join(th->cid, &schedLock); //releases lock
+                info("SyscallJoin: Barrier Join successful");
+            } else {
+                th->state = QUEUED;
+                runQueue.push_back(th);
+                waitForContext(th); //releases lock, might join
+            }
+            ThreadInfo* thTest = contexts[th->cid].curThread;
+            if(!thTest) { panic("Thread %u has been descheduled inappropriately.", tid); }
+            info("returned from syscall join");
+            return th->cid;
+        }
+
         uint32_t join(uint32_t pid, uint32_t tid) {
             futex_lock(&schedLock);
             //If leave was in this phase, call bar.join()
@@ -281,12 +338,6 @@ class Scheduler : public GlobAlloc, public Callee {
             //dsm 25 Oct 2012: Failed this assertion right after a fork when trying to simulate gedit. Very weird, cannot replicate.
             //dsm 10 Apr 2013: I think I got it. We were calling sched->finish() too early when following exec.
             assert_msg(th, "gid not found %d pid %d tid %d", gid, pid, tid);
-
-            if (unlikely(th->futexJoin.action != FJA_NONE)) {
-                if (th->futexJoin.action == FJA_WAIT) futexWaitJoin(th);
-                else futexWakeJoin(th);  // may release and grab schedLock to delay our join, this is fine at this point
-                th->futexJoin.action = FJA_NONE;
-            }
 
             // If we're in a fake leave, no need to do anything
             if (th->fakeLeave) {
@@ -325,6 +376,54 @@ class Scheduler : public GlobAlloc, public Callee {
             }
 
             return th->cid;
+        }
+
+        //This cannot block.
+        volatile uint32_t* mattsReasonableSyscallLeave(uint32_t pid, uint32_t tid, uint32_t cid, uint64_t wakeupPhase) {
+            futex_lock(&schedLock);
+            //Extracted from mark for sleep.
+            uint32_t gid = getGid(pid, tid);
+            ThreadInfo* th = contexts[cid].curThread;
+            //Error checking.
+            if(!th) { panic("Thread %u has been descheduled inappropriately.", tid); }
+            assert(!th->markedForSleep);
+            assert(th->gid == gid);
+            assert(th->state == RUNNING);
+            //Actual sleep actions
+            if(wakeupPhase < curPhase) wakeupPhase += curPhase;
+            th->wakeupPhase = wakeupPhase;
+            th->futexWord = 1; //to avoid races, this must be set here.
+            //Extracted from leave.
+            zinfo->cores[cid]->leave(); //Eventually we will do this but this thread
+            //is in the middle of a bbl and we will lose the bbl state info. Mostly
+            //important for non-simple cores.
+            info("Matts Syscall Leave called on tid %u and cid %u", tid, cid);
+            th->markedForSleep = false;
+            ContextInfo* ctx = &contexts[cid];
+            deschedule(th, ctx, SLEEPING);
+            //Ordered insert into sleepQueue
+            if (sleepQueue.empty() || sleepQueue.front()->wakeupPhase > th->wakeupPhase) {
+                sleepQueue.push_front(th);
+            } else {
+                ThreadInfo* cur = sleepQueue.front();
+                while (cur->next && cur->next->wakeupPhase <= th->wakeupPhase) {
+                    cur = cur->next;
+                }
+                sleepQueue.insertAfter(cur, th);
+            }
+            sleepEvents.inc();
+            ThreadInfo* inTh = schedContext(ctx);
+            if (inTh) {
+                warn("LEAVE was able to fill context with pid %u tid %u", getPid(inTh->gid), getTid(inTh->gid));
+                schedule(inTh, ctx);
+                zinfo->cores[ctx->cid]->join(); //inTh does not do a sched->join, so we need to notify the core since we just called leave() on it
+                wakeup(inTh, false /*no join, we did not leave*/);
+            } else {
+                freeList.push_back(ctx);
+                bar.leave(cid); //may trigger end of phase
+            }
+            futex_unlock(&schedLock);
+            return &(th->futexWord);
         }
 
         void leave(uint32_t pid, uint32_t tid, uint32_t cid) {
@@ -813,21 +912,18 @@ class Scheduler : public GlobAlloc, public Callee {
         // Externally, has the exact same behavior as leave(); internally, may choose to not actually leave;
         // join() and finish() handle this state
         void syscallLeave(uint32_t pid, uint32_t tid, uint32_t cid, uint64_t pc, int syscallNumber, uint64_t arg0, uint64_t arg1);
-
-        // Futex wake/wait matching interface
-        void notifyFutexWakeStart(uint32_t pid, uint32_t tid, uint32_t maxWakes);
-        void notifyFutexWakeEnd(uint32_t pid, uint32_t tid, uint32_t wokenUp);
-        void notifyFutexWaitWoken(uint32_t pid, uint32_t tid);
+        uint64_t getFutexWakePhase(bool realtime, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std);
+        int futexWakeOp(uint32_t pid, uint32_t tid, FutexInfo fi);
+        int futexMoveNWaiters(bool pi_wake, int *srcUaddr, int *targetUaddr, int val);
+        int futexWakeNWaiters(int bitmask, bool pi_wake, int *uaddr, int val);
+        int futexCmpReque(bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi);
+        int futexReque(uint32_t pid, uint32_t tid, FutexInfo fi);
+        int futexWake(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi);
+        bool futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t tid, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std);
+        int futexUnlock(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi);
+        bool futexSynchronized(uint32_t pid, uint32_t tid, FutexInfo fi);
 
     private:
-        volatile uint32_t maxAllowedFutexWakeups;
-        volatile uint32_t unmatchedFutexWakeups;
-
-        // Called with schedLock held, at the start of a join
-        void futexWakeJoin(ThreadInfo* th);  // may release and re-acquire schedLock
-        void futexWaitJoin(ThreadInfo* th);
-
-
         void finishFakeLeave(ThreadInfo* th);
 
         /* Must be called with schedLock held. Waits until the given thread is

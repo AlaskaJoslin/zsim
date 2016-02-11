@@ -34,6 +34,7 @@
 #include "profile_stats.h"
 #include "str.h"
 #include "virt/syscall_name.h"
+#include "virt/time_conv.h"
 
 //The scheduler class started simple, but at some point having it all in the header is too ridiculous. Migrate non perf-intensive calls here! (all but sync, really)
 
@@ -295,95 +296,286 @@ void Scheduler::syscallLeave(uint32_t pid, uint32_t tid, uint32_t cid, uint64_t 
     }
 }
 
-/* Wake/wait matching code */
-
-// External interface, must be non-blocking
-void Scheduler::notifyFutexWakeStart(uint32_t pid, uint32_t tid, uint32_t maxWakes) {
-    futex_lock(&schedLock);
-    ThreadInfo* th = gidMap[getGid(pid, tid)];
-    DEBUG_FUTEX("[%d/%d] wakeStart max %d", pid, tid, maxWakes);
-    assert(th->futexJoin.action == FJA_NONE);
-
-    // Programs sometimes call FUTEX_WAIT with maxWakes = UINT_MAX to wake
-    // everyone waiting on it; we cap to a reasonably high number to avoid
-    // overflows on maxAllowedFutexWakeups
-    maxWakes = MIN(maxWakes, 1<<24 /*16M wakes*/);
-
-    maxAllowedFutexWakeups += maxWakes;
-    th->futexJoin.maxWakes = maxWakes;
-    futex_unlock(&schedLock);
+uint64_t Scheduler::getFutexWakePhase(bool realtime, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std) {
+    int64_t waitNsec = 0;
+    uint64_t wakeupPhase = 0;
+    waitNsec = fi.timeout.tv_sec*1000000000L + fi.timeout.tv_nsec;
+    if (fi.op & FUTEX_CLOCK_REALTIME || realtime) {
+        uint32_t domain = zinfo->procArray[procIdx]->getClockDomain();
+        uint64_t simNs = cyclesToNs(zinfo->globPhaseCycles);
+        uint64_t offsetNs = simNs + zinfo->clockDomainInfo[domain].realtimeOffsetNs;
+        warn(" REALTIME FUTEX: %ld %ld %ld %ld", waitNsec, simNs, offsetNs, waitNsec-offsetNs);
+        waitNsec = (waitNsec > (int64_t)offsetNs)? (waitNsec - offsetNs) : 0;
+    }
+    if (waitNsec > 0) {
+        struct timespec fakeTimeouts = (struct timespec){0}; //Never timeout.
+        // fakeTimeouts.tv_sec = 9999999;
+        // fakeTimeouts.tv_nsec = 999999;
+        PIN_SetSyscallArgument(ctxt, std, 3, (ADDRINT)&fakeTimeouts);
+        uint64_t waitCycles = waitNsec*zinfo->freqMHz/1000;
+        uint64_t waitPhases = waitCycles/zinfo->phaseLength;
+        wakeupPhase = zinfo->numPhases + waitPhases;
+    }
+    return wakeupPhase;
 }
 
-void Scheduler::notifyFutexWakeEnd(uint32_t pid, uint32_t tid, uint32_t wokenUp) {
-    futex_lock(&schedLock);
-    ThreadInfo* th = gidMap[getGid(pid, tid)];
-    DEBUG_FUTEX("[%d/%d] wakeEnd woken %d", pid, tid, wokenUp);
-    th->futexJoin.action = FJA_WAKE;
-    th->futexJoin.wokenUp = wokenUp;
-    futex_unlock(&schedLock);
-}
-
-void Scheduler::notifyFutexWaitWoken(uint32_t pid, uint32_t tid) {
-    futex_lock(&schedLock);
-    ThreadInfo* th = gidMap[getGid(pid, tid)];
-    DEBUG_FUTEX("[%d/%d] waitWoken", pid, tid);
-    th->futexJoin = {FJA_WAIT, 0, 0};
-    futex_unlock(&schedLock);
-}
-
-// Internal, called with schedLock held
-void Scheduler::futexWakeJoin(ThreadInfo* th) {  // may release schedLock
-    assert(th->futexJoin.action == FJA_WAKE);
-
-    uint32_t maxWakes = th->futexJoin.maxWakes;
-    uint32_t wokenUp = th->futexJoin.wokenUp;
-
-    // Adjust allowance
-    assert(maxWakes <= maxAllowedFutexWakeups);
-    assert(wokenUp <= maxWakes);
-    maxAllowedFutexWakeups -= (maxWakes - wokenUp);
-
-    assert(unmatchedFutexWakeups <= maxAllowedFutexWakeups); // should panic...
-
-    DEBUG_FUTEX("Futex wake matching %d %d", unmatchedFutexWakeups, maxAllowedFutexWakeups);
-
-    while (true) {
-        futex_unlock(&schedLock);
-        uint64_t startNs = getNs();
-        uint32_t iters = 0;
-        while (wokenUp > unmatchedFutexWakeups) {
-            TrueSleep(10*(1 + iters));  // linear backoff, start small but avoid overwhelming the OS with short sleeps
-            iters++;
-            uint64_t curNs = getNs();
-            if (curNs - startNs > (2L<<31L) /* ~2s */) {
-                futex_lock(&schedLock);
-                warn("Futex wake matching failed (%d/%d) (external/ff waiters?)", unmatchedFutexWakeups, wokenUp);
-                unmatchedFutexWakeups = 0;
-                maxAllowedFutexWakeups -= wokenUp;
-                return;
-            }
-        }
-
-        futex_lock(&schedLock);
-
-        // Recheck after acquire, may have concurrent wakes here
-        if (wokenUp <= unmatchedFutexWakeups) {
-            unmatchedFutexWakeups -= wokenUp;
-            maxAllowedFutexWakeups -= wokenUp;
-            break;
+bool Scheduler::futexSynchronized(uint32_t pid, uint32_t tid, FutexInfo fi) {
+    for(int i = 0; (uint32_t)i < futexTable[fi.uaddr].size(); i++) {
+        if(futexTable[fi.uaddr][i].pid == pid && futexTable[fi.uaddr][i].tid == tid) {
+            return false;
         }
     }
-
-    DEBUG_FUTEX("Finished futex wake matching");
+    return true;
 }
 
-void Scheduler::futexWaitJoin(ThreadInfo* th) {
-    assert(th->futexJoin.action == FJA_WAIT);
-    if (unmatchedFutexWakeups >= maxAllowedFutexWakeups) {
-        warn("External futex wakes? (%d/%d)", unmatchedFutexWakeups, maxAllowedFutexWakeups);
-    } else {
-        unmatchedFutexWakeups++;
+bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t tid, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std) {
+    info("Scheduler: FUTEX WAIT called with bitmask %d pi %d pid %u tid %u", bitmask, pi_waiter, pid, tid);
+    uint64_t wakeUpPhases = getFutexWakePhase(pi_waiter, fi, ctxt, std);  //pi versions all interpret as realtime
+    if(wakeUpPhases == 0) {
+      wakeUpPhases = 0xffffffff;
     }
+    FutexWaiter tempWaiter; tempWaiter.pid = pid; tempWaiter.tid = tid;   tempWaiter.pi_waiter = pi_waiter;
+    tempWaiter.mask = 0xffffffff; tempWaiter.val = fi.val; tempWaiter.fi = fi; tempWaiter.allow_requeue = !pi_waiter;
+    if(!pi_waiter) { //Normal cases
+        if(fi.val != *fi.uaddr) {
+            warn("Cur val didn't match val in futex wait");
+            return false;
+        }
+        info("WAIT took normal path");
+        if(bitmask) {
+            tempWaiter.mask = fi.val3;
+        }
+        futexTable[fi.uaddr].push_back(tempWaiter);
+        mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+    } else {    //if pi_waiter
+        switch (fi.op & FUTEX_CMD_MASK) {
+            case FUTEX_LOCK_PI:
+                info("WAIT took lock path");
+                if(futexTable[fi.uaddr].size() == 0) // Check that no one else is in line.
+                {
+                    info("FUTEX_LOCK_PI successfully locked");
+                    futexTable[fi.uaddr].push_back(tempWaiter); //Notice we don't deschedule
+                    return true;
+                } else {
+                  info("LOCK delayed");
+                  if(bitmask) {
+                      tempWaiter.mask = fi.val3;
+                  }
+                  futexTable[fi.uaddr].push_back(tempWaiter);
+                  mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+                }
+                break;
+            case FUTEX_WAIT_REQUEUE_PI:
+                info("WAIT took reque pi path");
+                if(fi.val != *fi.uaddr) {
+                    warn("Cur val didn't match val in futex wait");
+                    return false;
+                }
+                tempWaiter.allow_requeue = true;
+                if(bitmask) {
+                    tempWaiter.mask = fi.val3;
+                }
+                mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+                futexTable[fi.uaddr].push_back(tempWaiter);
+                break;
+            case FUTEX_TRYLOCK_PI:
+                info("WAIT took trylock path");
+                if(futexTable[fi.uaddr].size() == 0) {
+                    info("FUTEX_LOCK_PI successfully locked");
+                    futexTable[fi.uaddr].push_back(tempWaiter); //Notice we don't deschedule
+                    return true;
+                } else {
+                    return false;
+                }
+                break;
+            default:
+                panic("We missed something in futex wait.");
+        }
+    }
+    return true;
+}
+
+int Scheduler::futexWake(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
+    info("Scheduler: FUTEX WAKE called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
+    int bitmaskValue = 0xffffffff;
+    if(bitmask) {
+        bitmaskValue = fi.val3;
+    }
+    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
+    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
+    int waitersToWake = futexWakeNWaiters(bitmaskValue, pi_wake, fi.uaddr, fi.val);
+    return waitersToWake;
+}
+
+int Scheduler::futexUnlock(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
+    info("Scheduler: FUTEX UNLOCK called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
+    //We are responsible for removing the owner. Then we go back to wake.
+    if(futexTable[fi.uaddr].size() > 0 && futexTable[fi.uaddr].front().pi_waiter
+        && futexTable[fi.uaddr].front().tid == tid  && futexTable[fi.uaddr].front().pid == pid )
+    {
+        futexTable[fi.uaddr].pop_front(); //We were already awake
+        assert(!isSleeping(pid, tid));
+        return futexWake(bitmask, pi_wake, pid, tid, fi);
+    }
+    else {
+      warn("something is screwy in unlock");
+    }
+    return 0;
+}
+
+int Scheduler::futexReque(uint32_t pid, uint32_t tid, FutexInfo fi) {
+    info("Scheduler: FUTEX REQUE called with pid %u tid %u", pid, tid);
+    bool extraWaiters = futexTable[fi.uaddr].size() > (uint32_t)fi.val;
+    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
+    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
+    int waitersToWake = futexWakeNWaiters(0xffffffff, false, fi.uaddr, fi.val);
+    int extraWaitersToWake = 0;
+    if(extraWaiters) {
+        extraWaitersToWake = futexMoveNWaiters(false, fi.uaddr, fi.uaddr2, fi.val2);
+    }
+    return waitersToWake + extraWaitersToWake;
+}
+
+int Scheduler::futexCmpReque(bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
+    info("Scheduler: FUTEX CMP REQUE called with pi %d pid %u tid %u", pi_wake, pid, tid);
+    int *curVal = 0;
+    if(!safeCopy(fi.uaddr, curVal)) {
+        panic("Futex Wait wasn't able to copy the data.");
+    }
+    if(fi.val3 != *curVal) {
+        warn("Cur val didn't match val in futex wait");
+        return 0;
+    }
+    bool extraWaiters = futexTable[fi.uaddr].size() > (uint32_t)fi.val;
+    int waitersToWake = 0;
+    if(!pi_wake) {
+        // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
+        // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
+        futexWakeNWaiters(pi_wake, 0xffffffff, fi.uaddr, fi.val);
+    }
+    int extraWaitersToWake = 0;
+    if(extraWaiters) {
+        extraWaitersToWake = futexMoveNWaiters(pi_wake, fi.uaddr, fi.uaddr2, fi.val2);
+    }
+    return waitersToWake + extraWaitersToWake;
+}
+//Must be called without lock. Returns # waiters.
+int Scheduler::futexWakeNWaiters(int bitmask, bool p_waiter, int *uaddr, int val) {
+  info("Scheduler: FUTEX WAKE N WAITERS called with bitmask %d pi %d uaddr %p val %d", bitmask, p_waiter, uaddr, val);
+  int waitersToWake = 0;
+  int waitersFailed = 0;
+  bool piWakeInUserSpace = ((futexTable[uaddr].size() == 1) && futexTable[uaddr].front().pi_waiter);
+  assert(!piWakeInUserSpace)
+  if(p_waiter) {
+      for(int i = 1; (uint32_t)i < futexTable[uaddr].size(); i++) {
+          if(futexTable[uaddr][i].pi_waiter) {
+            FutexWaiter tempWaiter = futexTable[uaddr][i];
+            futexTable[uaddr].erase(futexTable[uaddr].begin() + waitersFailed);
+            futexTable[uaddr].push_front(tempWaiter);
+            warn("we had a pi requestor jump to front of line");
+            return 1;
+          }
+      }
+  }
+  while((uint32_t)waitersToWake < futexTable[uaddr].size() && waitersToWake < val) {
+      FutexWaiter tempWaiter = futexTable[uaddr][waitersFailed];
+      if(bitmask && tempWaiter.mask & ~bitmask) {
+          waitersFailed++;
+      } else {
+          waitersToWake++;
+          futexTable[uaddr].erase(futexTable[uaddr].begin() + waitersFailed);
+      }
+  }
+  info("WAKE N WAITERS Looped %d times", waitersFailed + waitersToWake);
+  return waitersToWake;
+}
+
+//Must be called with lock held. Will not release. Returns # waiters moved.
+int Scheduler::futexMoveNWaiters(bool pi_wake, int *srcUaddr, int *targetUaddr, int val) {
+  info("Scheduler: FUTEX MOVE N WAITERS called with pi %d src %p targ %p val %d", pi_wake, srcUaddr, targetUaddr, val);
+  int waitersToMove = 0;
+  int waitersFailed = 0;
+  while((uint32_t)waitersToMove < futexTable[srcUaddr].size() && waitersToMove < val) {
+      FutexWaiter tempWaiter = futexTable[srcUaddr][waitersFailed];
+      if(pi_wake) {
+        if(tempWaiter.pi_waiter) {
+            waitersToMove++;
+            futexTable[srcUaddr].erase(futexTable[srcUaddr].begin() + waitersFailed);
+            futexTable[tempWaiter.fi.uaddr2].push_back(tempWaiter);
+        } else {
+            waitersFailed++;
+        }
+      } else {
+        waitersToMove++;
+        futexTable[srcUaddr].erase(futexTable[srcUaddr].begin() + waitersFailed);
+        futexTable[targetUaddr].push_back(tempWaiter);
+      }
+  }
+  return waitersToMove;
+}
+
+int Scheduler::futexWakeOp(uint32_t pid, uint32_t tid, FutexInfo fi) {
+    info("Scheduler: FUTEX WAKE OP called with pid %u tid %u", pid, tid);
+    //From the man page
+    //  int oldval = *(int *) uaddr2;
+    int *oldVal = 0;
+    if(!safeCopy(fi.uaddr2, oldVal)) {
+        panic("Futex Wake Op wasn't able to copy the data.");
+    }
+    //val3 contains
+    // |op |cmp|   oparg   |  cmparg   |
+    //   4   4       12          12    <== # of bits
+    // #define FUTEX_OP(op, oparg, cmp, cmparg)
+    int op = (fi.val3 & 0xf) >> 28;      // (((op & 0xf) << 28) |
+    int cmp = (fi.val3 & 0xf) >> 24;     // ((cmp & 0xf) << 24) |
+    int oparg = (fi.val3 & 0xfff) >> 12; // ((oparg & 0xfff) << 12) |
+    int cmparg = (fi.val3 & 0xfff);      // (cmparg & 0xfff))
+    // Bit-wise ORing the following value into op causes
+    // (1 << oparg) to be used as the operand: FUTEX_OP_ARG_SHIFT  8
+    if(op & 8) { oparg = 1 << oparg; }
+    int *newVal; *newVal = 0;
+    //  *(int *) uaddr2 = oldval op oparg;
+    switch (op) { //Op is defined as:
+      case 0: // FUTEX_OP_SET        0  /* uaddr2 = oparg; */
+          *newVal = oparg;
+      case 1: // FUTEX_OP_ADD        1  /* uaddr2 += oparg; */
+          *newVal = *(fi.uaddr2) + oparg;
+      case 2: // FUTEX_OP_OR         2  /* uaddr2 |= oparg; */
+          *newVal = *(fi.uaddr2) | oparg;
+      case 3: // FUTEX_OP_ANDN       3  /* uaddr2 &= ~oparg; */
+          *newVal = *(fi.uaddr2) & ~oparg;
+      case 4: // FUTEX_OP_XOR        4  /* uaddr2 ^= oparg; */
+          *newVal = *(fi.uaddr2) ^ oparg;
+      default:
+          panic("We are missing an op type in sched wake op");
+    }
+    //  futex(uaddr, FUTEX_WAKE, val, 0, 0, 0);
+    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
+    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
+    int waitersToWake = futexWakeNWaiters(false, 0xffffffff, fi.uaddr, fi.val);
+    bool cmpResult = false;
+    switch (cmp) { // The cmp field is one of the following:
+      case 0: //   FUTEX_OP_CMP_EQ     0  /* if (oldval == cmparg) wake */
+          cmpResult = (*oldVal == cmparg);
+      case 1: //   FUTEX_OP_CMP_NE     1  /* if (oldval != cmparg) wake */
+          cmpResult = (*oldVal != cmparg);
+      case 2: //   FUTEX_OP_CMP_LT     2  /* if (oldval < cmparg) wake */
+          cmpResult = (*oldVal < cmparg);
+      case 3: //   FUTEX_OP_CMP_LE     3  /* if (oldval <= cmparg) wake */
+          cmpResult = (*oldVal <= cmparg);
+      case 4: //   FUTEX_OP_CMP_GT     4  /* if (oldval > cmparg) wake */
+          cmpResult = (*oldVal > cmparg);
+      case 5: //   FUTEX_OP_CMP_GE     5  /* if (oldval >= cmparg) wake */
+          cmpResult = (*oldVal >= cmparg);
+      default:
+          panic("We are missing a case for cmp");
+    }
+    int extraWaitersToWake = 0;
+    if(cmpResult) { //  if (oldval cmp cmparg)
+      //    futex(uaddr2, FUTEX_WAKE, val2, 0, 0, 0);
+      extraWaitersToWake = futexWakeNWaiters(false, 0xffffffff, newVal, fi.val2);
+    }
+    return waitersToWake + extraWaitersToWake;
 }
 
 void Scheduler::finishFakeLeave(ThreadInfo* th) {

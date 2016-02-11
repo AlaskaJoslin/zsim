@@ -23,6 +23,7 @@
  * this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <syscall.h>
 #include "constants.h"
 #include "log.h"
 #include "scheduler.h"
@@ -32,220 +33,288 @@
 #include "virt/time_conv.h"
 #include "zsim.h"
 
-static struct timespec fakeTimeouts[MAX_THREADS]; //for syscalls that use timespec to indicate a timeout
 static bool inFakeTimeoutMode[MAX_THREADS];
+
+struct TimeoutRetVals {
+    int retValue;
+    Scheduler::FutexInfo fi;
+    bool switchToJoin;
+    bool prePatchMode;
+};
+static struct TimeoutRetVals threadBlockingInfo[MAX_THREADS] = {0, {0}, false, false};
 
 static bool SkipTimeoutVirt(PrePatchArgs args) {
     // having both conditions ensures that we don't virtualize in the interim of toggling ff ON
     return args.isNopThread || zinfo->procArray[procIdx]->isInFastForward();
 }
 
-// Helper function, see /usr/include/linux/futex.h
-static bool isFutexWaitOp(int op) {
-    switch (op & FUTEX_CMD_MASK) { //handles PRIVATE / REALTIME as well
-        case FUTEX_WAIT:
-        case FUTEX_WAIT_BITSET:
-        case FUTEX_WAIT_REQUEUE_PI:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool isFutexWakeOp(int op) {
-    switch (op & FUTEX_CMD_MASK) {
-        case FUTEX_WAKE:
-        case FUTEX_REQUEUE:
-        case FUTEX_CMP_REQUEUE:
-        case FUTEX_WAKE_OP:
-        case FUTEX_WAKE_BITSET:
-        case FUTEX_CMP_REQUEUE_PI:
-            return true;
-        default:
-            return false;
-    }
-}
-
-
-static int getTimeoutArg(int syscall) {
-    if (syscall == SYS_poll) return 2;
+static int getTimeoutArg(int syscallNum) {
+    if (syscallNum == SYS_poll) return 2;
     return 3;  // futex, epoll_wait, epoll_pwait
 }
 
-static bool PrePatchTimeoutSyscall(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std, int syscall) {
-    assert(!inFakeTimeoutMode[tid]);  // canary: this will probably fail...
-    int64_t waitNsec = 0;
-
-    // Per-syscall manipulation. This code either succeeds, fakes timeout value and sets waitNsec, or returns false
-    int timeoutArg = getTimeoutArg(syscall);
-    if (syscall == SYS_futex) {
-        // Check preconditions
-        assert(timeoutArg == 3);
-        int* uaddr = (int*) PIN_GetSyscallArgument(ctxt, std, 0);
-        int op = (int) PIN_GetSyscallArgument(ctxt, std, 1);
-        const struct timespec* timeout = (const struct timespec*) PIN_GetSyscallArgument(ctxt, std, 3);
-
-        //info("FUTEX op %d  waitOp %d uaddr %p ts %p", op, isFutexWaitOp(op), uaddr, timeout);
-        if (!(uaddr && isFutexWaitOp(op) && timeout)) return false;  // not a timeout FUTEX_WAIT
-
-        waitNsec = timeout->tv_sec*1000000000L + timeout->tv_nsec;
-
-        if (op & FUTEX_CLOCK_REALTIME) {
-            // NOTE: FUTEX_CLOCK_REALTIME is not a documented interface AFAIK, but looking at the Linux source code + with some verification, this is the xlat
-            uint32_t domain = zinfo->procArray[procIdx]->getClockDomain();
-            uint64_t simNs = cyclesToNs(zinfo->globPhaseCycles);
-            uint64_t offsetNs = simNs + zinfo->clockDomainInfo[domain].realtimeOffsetNs;
-            //info(" REALTIME FUTEX: %ld %ld %ld %ld", waitNsec, simNs, offsetNs, waitNsec-offsetNs);
-            waitNsec = (waitNsec > (int64_t)offsetNs)? (waitNsec - offsetNs) : 0;
-        }
-
-        if (waitNsec <= 0) return false;  // while technically waiting, this does not block. I'm guessing this is done for trylocks? It's weird.
-
-        fakeTimeouts[tid].tv_sec = 0;
-        fakeTimeouts[tid].tv_nsec = 20*1000*1000;  // timeout every 20ms of actual host time
-        PIN_SetSyscallArgument(ctxt, std, 3, (ADDRINT)&fakeTimeouts[tid]);
-    } else {
-        assert(syscall == SYS_epoll_wait || syscall == SYS_epoll_pwait || syscall == SYS_poll);
-        int timeout = (int) PIN_GetSyscallArgument(ctxt, std, timeoutArg);
-        if (timeout <= 0) return false;
-        //info("[%d] pre-patch epoll_wait/pwait", tid);
-
-        PIN_SetSyscallArgument(ctxt, std, timeoutArg, 20); // 20ms timeout
-        waitNsec = ((uint64_t)timeout)*1000*1000;  // timeout is in ms
+//int futex(int *uaddr, int futex_op, int val,
+//          const struct timespec *timeout,   /* or: uint32_t val2 */
+//          int *uaddr2, int val3);
+static Scheduler::FutexInfo getFilledInFutex(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std) {
+    Scheduler::FutexInfo fi;
+    fi.uaddr = (int*) PIN_GetSyscallArgument(ctxt, std, 0);
+    info("uaddr: %p %i", fi.uaddr, *(fi.uaddr));
+    fi.op = (int) PIN_GetSyscallArgument(ctxt, std, 1);
+    info("op: %i", fi.op);
+    fi.val = (int) PIN_GetSyscallArgument(ctxt, std, 2);
+    info("val: %i", fi.val);
+    fi.uaddr2 = (int*) PIN_GetSyscallArgument(ctxt, std, 4);
+    info("uaddr2: %p", fi.uaddr2);
+    fi.val3 = (uint32_t) PIN_GetSyscallArgument(ctxt, std, 5);
+    info("val3: %i", fi.val3);
+    switch (fi.op & FUTEX_CMD_MASK) {
+        case FUTEX_REQUEUE:
+            info("FUTEX_REQUE");
+            break;
+        case FUTEX_CMP_REQUEUE:
+            info("FUTEX_CMP_REQUEUE");
+            break;
+        case FUTEX_CMP_REQUEUE_PI:
+            info("FUTEX_CMP_REQUEUE_PI");
+            break;
+        case FUTEX_WAKE_BITSET:
+            info("FUTEX_WAKE_BITSET");
+            break;
+        case FUTEX_WAKE:
+            info("FUTEX_WAKE");
+            break;
+        case FUTEX_WAKE_OP:
+            info("FUTEX_WAKE_OP");
+            break;
+        case FUTEX_WAIT:
+            info("FUTEX_WAIT");
+            break;
+        case FUTEX_WAIT_BITSET:
+            info("FUTEX_WAIT_BITSET");
+            break;
+        case FUTEX_LOCK_PI:
+            info("FUTEX_LOCK_PI");
+            break;
+        case FUTEX_WAIT_REQUEUE_PI:
+            info("FUTEX_WAIT_REQUEUE_PI");
+            break;
     }
+    switch (fi.op & FUTEX_CMD_MASK) {
+        case FUTEX_REQUEUE:
+        case FUTEX_CMP_REQUEUE:
+        case FUTEX_CMP_REQUEUE_PI:
+        case FUTEX_WAKE_BITSET:
+        case FUTEX_WAKE:
+        case FUTEX_WAKE_OP:
+            fi.val2 = (uint32_t) PIN_GetSyscallArgument(ctxt, std, 3);
+            fi.timeout = {0,0};
+            break;
+        case FUTEX_WAIT:
+        case FUTEX_WAIT_BITSET:
+        case FUTEX_LOCK_PI:
+        case FUTEX_WAIT_REQUEUE_PI:
+            fi.val2 = 0;
+            const struct timespec* timeout = (const struct timespec*) PIN_GetSyscallArgument(ctxt, std, 3);
+            if(timeout)
+            {
+              fi.timeout = *timeout;
+            }
+            break;
+    }
+    info("val2: %u", fi.val2);
+    info("timeout: %li %li", fi.timeout.tv_sec, fi.timeout.tv_nsec);
+    return fi;
+}
 
-    //info("[%d] pre-patch %s (%d) waitNsec = %ld", tid, GetSyscallName(syscall), syscall, waitNsec);
-
+//This has now been refactored so that it is only called for non futex syscallNums.
+// Per-syscallNum manipulation. This code either succeeds, fakes timeout value and sets waitNsec, or returns false
+static bool PrePatchTimeoutSyscall(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std, int syscallNum) {
+    warn("We took a non futex path in timeout");
+    int64_t waitNsec = 0;
+    int timeoutArg = getTimeoutArg(syscallNum);
+    int timeout = (int) PIN_GetSyscallArgument(ctxt, std, timeoutArg);
+    if (timeout <= 0)
+    {  return false; }
+    PIN_SetSyscallArgument(ctxt, std, timeoutArg, 20); // 20ms timeout
+    waitNsec = ((uint64_t)timeout)*1000*1000;  // timeout is in ms
     uint64_t waitCycles = waitNsec*zinfo->freqMHz/1000;
     uint64_t waitPhases = waitCycles/zinfo->phaseLength;
-    if (waitPhases < 2) waitPhases = 2;  // at least wait 2 phases; this should basically eliminate the chance that we get a SIGSYS before we start executing the syscal instruction
+    if (waitPhases < 2) { waitPhases = 2; }
     uint64_t wakeupPhase = zinfo->numPhases + waitPhases;
-
-    /*volatile uint32_t* futexWord =*/ zinfo->sched->markForSleep(procIdx, tid, wakeupPhase);  // we still want to mark for sleep, bear with me...
+    zinfo->sched->markForSleep(procIdx, tid, wakeupPhase);
     inFakeTimeoutMode[tid] = true;
     return true;
 }
 
-static bool PostPatchTimeoutSyscall(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std, int syscall, ADDRINT prevIp, ADDRINT timeoutArgVal) {
+//This function generically figures out what kind of InstrFuncPtrs we should use.
+static bool PostPatchTimeoutSyscall(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std, int syscallNum, ADDRINT prevIp, ADDRINT timeoutArgVal) {
+    warn("We took a non futex path in timeout");
     assert(inFakeTimeoutMode[tid]);
     int res = (int)PIN_GetSyscallNumber(ctxt, std);
-
-    // Decide if it timed out
-    bool timedOut;
-    if (syscall == SYS_futex) {
-        timedOut = (res == -ETIMEDOUT);
-    } else {
-        timedOut = (res == 0);
-    }
-
+    bool timedOut = (res == 0);
     bool isSleeping = zinfo->sched->isSleeping(procIdx, tid);
-
-    // Decide whether to retry
     bool retrySyscall;
     if (!timedOut) {
-        if (isSleeping) zinfo->sched->notifySleepEnd(procIdx, tid);
+        if (isSleeping) {
+           zinfo->sched->notifySleepEnd(procIdx, tid);
+        }
         retrySyscall = false;
     } else {
         retrySyscall = isSleeping;
     }
-
     if (retrySyscall && zinfo->procArray[procIdx]->isInFastForward()) {
-        warn("[%d] Fast-forwarding started, not retrying timeout syscall (%s)", tid, GetSyscallName(syscall));
+        warn("[%d] Fast-forwarding started, not retrying timeout syscallNum (%s)", tid, GetSyscallName(syscallNum));
         retrySyscall = false;
         assert(isSleeping);
         zinfo->sched->notifySleepEnd(procIdx, tid);
     }
-
     if (retrySyscall) {
-        // ADDRINT curIp = PIN_GetContextReg(ctxt, REG_INST_PTR);
-        //info("[%d] post-patch, retrying, IP: 0x%lx -> 0x%lx", tid, curIp, prevIp);
+        ADDRINT curIp = PIN_GetContextReg(ctxt, REG_INST_PTR);
+        info("[%d] post-patch, retrying, IP: 0x%lx -> 0x%lx", tid, curIp, prevIp);
         PIN_SetContextReg(ctxt, REG_INST_PTR, prevIp);
-        PIN_SetSyscallNumber(ctxt, std, syscall);
+        PIN_SetSyscallNumber(ctxt, std, syscallNum);
     } else {
-        // Restore timeout arg
-        PIN_SetSyscallArgument(ctxt, std, getTimeoutArg(syscall), timeoutArgVal);
+        PIN_SetSyscallArgument(ctxt, std, getTimeoutArg(syscallNum), timeoutArgVal);
         inFakeTimeoutMode[tid] = false;
-
-        // Restore arg? I don't think we need this!
-        /*if (syscall == SYS_futex) {
-            PIN_SetSyscallNumber(ctxt, std, -ETIMEDOUT);
-        } else {
-            assert(syscall == SYS_epoll_wait || syscall == SYS_epoll_pwait || syscall == SYS_poll);
-            PIN_SetSyscallNumber(ctxt, std, 0); //no events returned
-        }*/
     }
-
-    //info("[%d] post-patch %s (%d), timedOut %d, sleeping (orig) %d, retrying %d, orig res %d, patched res %d", tid, GetSyscallName(syscall), syscall, timedOut, isSleeping, retrySyscall, res, (int)PIN_GetSyscallNumber(ctxt, std));
+    info("[%d] post-patch %s (%d), timedOut %d, sleeping (orig) %d, retrying %d, orig res %d, patched res %d", tid, GetSyscallName(syscallNum), syscallNum, timedOut, isSleeping, retrySyscall, res, (int)PIN_GetSyscallNumber(ctxt, std));
     return retrySyscall;
 }
 
-/* Notify scheduler about FUTEX_WAITs woken up by FUTEX_WAKEs, FUTEX_WAKE entries, and FUTEX_WAKE exits */
-
-struct FutexInfo {
-    int op;
-    int val;
-};
-
-FutexInfo PrePatchFutex(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std) {
-    FutexInfo fi;
-    fi.op = (int) PIN_GetSyscallArgument(ctxt, std, 1);
-    fi.val = (int) PIN_GetSyscallArgument(ctxt, std, 2);
-    if (isFutexWakeOp(fi.op)) {
-        zinfo->sched->notifyFutexWakeStart(procIdx, tid, fi.val);
-    }
-    return fi;
-}
-
-void PostPatchFutex(uint32_t tid, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std) {
-    int res = (int) PIN_GetSyscallNumber(ctxt, std);
-    if (isFutexWaitOp(fi.op) && res == 0) {
-        zinfo->sched->notifyFutexWaitWoken(procIdx, tid);
-    } else if (isFutexWakeOp(fi.op) && res >= 0) {
-        /* In contrast to the futex manpage, from the kernel's futex.c
-         * (do_futex), WAKE and WAKE_OP return the number of threads woken up,
-         * but the REQUEUE and CMP_REQUEUE and REQUEUE_PI ops return the number
-         * of threads woken up + requeued. However, these variants
-         * (futex_requeue) first try to wake the specified threads, then
-         * requeue as many other threads as they can.
-         *
-         * Therefore, this wokenUp expression should be correct for all variants
-         * of SYS_futex that wake up threads (WAKE, REQUEUE, CMP_REQUEUE, ...)
-         */
-        uint32_t wokenUp = std::min(res, fi.val);
-        zinfo->sched->notifyFutexWakeEnd(procIdx, tid, wokenUp);
-    }
-}
-
 PostPatchFn PatchTimeoutSyscall(PrePatchArgs args) {
-    if (SkipTimeoutVirt(args)) return NullPostPatch;
-
-    int syscall = PIN_GetSyscallNumber(args.ctxt, args.std);
-    assert_msg(syscall == SYS_futex || syscall == SYS_epoll_wait || syscall == SYS_epoll_pwait || syscall == SYS_poll,
-            "Invalid timeout syscall %d", syscall);
-
-    FutexInfo fi = {0, 0};
-    if (syscall == SYS_futex) fi = PrePatchFutex(args.tid, args.ctxt, args.std);
-
-    if (PrePatchTimeoutSyscall(args.tid, args.ctxt, args.std, syscall)) {
-        ADDRINT prevIp = PIN_GetContextReg(args.ctxt, REG_INST_PTR);
-        ADDRINT timeoutArgVal = PIN_GetSyscallArgument(args.ctxt, args.std, getTimeoutArg(syscall));
-        return [syscall, prevIp, timeoutArgVal, fi](PostPatchArgs args) {
-            if (PostPatchTimeoutSyscall(args.tid, args.ctxt, args.std, syscall, prevIp, timeoutArgVal)) {
-                return PPA_USE_RETRY_PTRS;  // retry
-            } else {
-                if (syscall == SYS_futex) PostPatchFutex(args.tid, fi, args.ctxt, args.std);
-                return PPA_USE_JOIN_PTRS;  // finish
-            }
-        };
-    } else {
-        if (syscall == SYS_futex) {
-            return [fi](PostPatchArgs args) {
-                PostPatchFutex(args.tid, fi, args.ctxt, args.std);
-                return PPA_NOTHING;
-            };
-        } else {
-            return NullPostPatch;
-        }
+    if (SkipTimeoutVirt(args)) {
+        return NullPostPatch;  //We reach this path if we aren't simulating threads or are fast-forwarding
     }
+    int syscallNum = PIN_GetSyscallNumber(args.ctxt, args.std);
+    Scheduler::FutexInfo fi;
+    ADDRINT prevIp = PIN_GetContextReg(args.ctxt, REG_INST_PTR);
+    ADDRINT timeoutArgVal = PIN_GetSyscallArgument(args.ctxt, args.std, getTimeoutArg(syscallNum));
+    assert_msg(syscallNum == SYS_futex || syscallNum == SYS_epoll_wait || syscallNum == SYS_epoll_pwait || syscallNum == SYS_poll,
+      "Invalid timeout syscallNum %d", syscallNum);
+    threadBlockingInfo[args.tid].prePatchMode = !threadBlockingInfo[args.tid].prePatchMode; //Toggle
+    if(threadBlockingInfo[args.tid].prePatchMode) {
+      if (syscallNum == SYS_futex) {
+        // zinfo->usingFutex[args.tid] = true;
+        info("Pre Patch Futex tid %u", args.tid);
+        fi = getFilledInFutex(args.tid, args.ctxt, args.std);
+        switch (fi.op & FUTEX_CMD_MASK) {
+            case FUTEX_WAIT:
+                //  If uaddr contains val then sleeps waiting for FUTEX_WAKE.
+                //  Ordered. If val does not match uaddr then fails with EAGAIN.
+                //  If timeout is null, block indefinitely. Else wait according
+                //  to CLOCK_MONOTONIC. Round up if necessary.
+                if(!zinfo->sched->futexWait(false, false, procIdx, args.tid, fi, args.ctxt, args.std)) {
+                  fi.retValue = EAGAIN;
+                } else {
+                  fi.retValue = 0;
+                }
+                break;
+            case FUTEX_WAIT_BITSET:
+                //  Like FUTEX_WAIT except val3 specifies a bit wise & mask for the
+                //  waiters. Bitwise and Also can use FUTEX_CLOCK_REALTIME.
+                if(!zinfo->sched->futexWait(true, false, procIdx, args.tid, fi, args.ctxt, args.std)) {
+                    fi.retValue = EAGAIN;
+                } else {
+                    fi.retValue = 0;
+                }
+                break;
+            case FUTEX_TRYLOCK_PI:
+            case FUTEX_LOCK_PI:
+            case FUTEX_WAIT_REQUEUE_PI:
+                if(!zinfo->sched->futexWait(false, true, procIdx, args.tid, fi, args.ctxt, args.std)) {
+                    fi.retValue = EAGAIN;
+                } else {
+                    fi.retValue = 0;
+                }
+                break;
+            case FUTEX_WAKE:
+                //  Wakes at most val of waiters on uaddr. No guarantee on priority.
+                // Returns the number of waiters that were woken up.
+                fi.retValue = zinfo->sched->futexWake(false, false, procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_FD: //  definitely panic. This operation hasn't been supported since Linux 2.6.something
+                panic("We don't support FUTEX_FD.");
+            case FUTEX_REQUEUE: //  Same as FUTEX_CMP_REQUEUE without the comparison.
+                fi.retValue = zinfo->sched->futexReque(procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_CMP_REQUEUE:
+                //  Checks that uaddr still contains val3. If not return EAGAIN.
+                //  Otherwise wake up at most val waiters. If waiters > val, then
+                //  at most val2 of the remaining waiters are removed from
+                //  uaddr's queue and placed in uaddr2's queue.
+                fi.retValue = zinfo->sched->futexCmpReque(false, procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_WAKE_OP:
+                zinfo->sched->futexWakeOp(procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_WAKE_BITSET:
+                //  Like FUTEX_WAKE except val3 is used as a bitwise & of the values
+                //  stored from FUTEX_WAIT_BITSET. Normal WAIT and WAKE functions have
+                //  bit masks of all 1s.
+                fi.retValue = zinfo->sched->futexWake(true, false, procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_UNLOCK_PI:
+                // This operation wakes the top priority waiter that is waiting
+                // in FUTEX_LOCK_PI on the futex address provided by the uaddr argument.
+                fi.retValue = zinfo->sched->futexUnlock(false, true, procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            case FUTEX_CMP_REQUEUE_PI:
+                // This operation is a PI-aware variant of FUTEX_CMP_REQUEUE.
+                fi.retValue = zinfo->sched->futexCmpReque(true, procIdx, args.tid, fi);
+                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
+                break;
+            default:
+                panic("We are missing a case for futex.");
+        }
+        info("Finished futex syscall with return value: %i", fi.retValue);
+        threadBlockingInfo[args.tid].retValue = fi.retValue;
+        threadBlockingInfo[args.tid].fi = fi;
+      } else {
+        PrePatchTimeoutSyscall(args.tid, args.ctxt, args.std, syscallNum); //TODO this has a return value
+      }
+      return NullPostPatch;
+    } else {
+      if (syscallNum == SYS_futex) {
+          switch (threadBlockingInfo[args.tid].fi.op & FUTEX_CMD_MASK) {
+              case FUTEX_WAIT:
+              case FUTEX_WAIT_BITSET:
+              case FUTEX_LOCK_PI:
+              case FUTEX_WAIT_REQUEUE_PI:
+              if(threadBlockingInfo[args.tid].retValue == 0) {  //We suceeded
+                      info("Thread tid %d saw a matching actual wake", args.tid);
+                      zinfo->sched->syscallJoin(procIdx, args.tid);
+                      // zinfo->sched->sync(procIdx, args.tid, getCid(args.tid));
+                  } else {
+                      info("Thread tid %d failed", args.tid);
+                  }
+                  break;
+              default:
+                  // zinfo->sched->join(procIdx, args.tid);
+                  // zinfo->sched->syscallJoin(procIdx, args.tid);
+                  // zinfo->sched->sync(procIdx, args.tid, getCid(args.tid));
+                  info("Thread tid %d was a wake and returned with %d", args.tid, threadBlockingInfo[args.tid].fi.retValue);
+          }
+          return NullPostPatch;
+      }
+      else if(PostPatchTimeoutSyscall(args.tid, args.ctxt, args.std, syscallNum, prevIp, timeoutArgVal))
+      {
+        return [syscallNum, prevIp, fi](PostPatchArgs args) {
+          return PPA_USE_RETRY_PTRS; //TODO check correctness.
+        };
+      }
+      else
+      {
+        return [syscallNum, prevIp, fi](PostPatchArgs args) {
+          return PPA_USE_JOIN_PTRS;
+        };
+      }
+    }
+    return NullPostPatch;
 }
-
