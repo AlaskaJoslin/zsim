@@ -45,8 +45,8 @@
 //#define DEBUG_FL(args...) info(args)
 #define DEBUG_FL(args...)
 
-//#define DEBUG_FUTEX(args...) info(args)
-#define DEBUG_FUTEX(args...)
+#define DEBUG_FUTEX(args...) info(args)
+// #define DEBUG_FUTEX(args...)
 
 // Unlike glibc's sleep functions suck, this ensures guaranteed minimum sleep time
 static void TrueSleep(uint32_t usecs) {
@@ -309,8 +309,6 @@ uint64_t Scheduler::getFutexWakePhase(bool realtime, FutexInfo fi, CONTEXT* ctxt
     }
     if (waitNsec > 0) {
         struct timespec fakeTimeouts = (struct timespec){0}; //Never timeout.
-        // fakeTimeouts.tv_sec = 9999999;
-        // fakeTimeouts.tv_nsec = 999999;
         PIN_SetSyscallArgument(ctxt, std, 3, (ADDRINT)&fakeTimeouts);
         uint64_t waitCycles = waitNsec*zinfo->freqMHz/1000;
         uint64_t waitPhases = waitCycles/zinfo->phaseLength;
@@ -320,17 +318,22 @@ uint64_t Scheduler::getFutexWakePhase(bool realtime, FutexInfo fi, CONTEXT* ctxt
 }
 
 bool Scheduler::futexSynchronized(uint32_t pid, uint32_t tid, FutexInfo fi) {
-    for(int i = 0; (uint32_t)i < futexTable[fi.uaddr].size(); i++) {
-        if(futexTable[fi.uaddr][i].pid == pid && futexTable[fi.uaddr][i].tid == tid) {
-            return false;
-        }
+    futex_lock(&schedLock);
+    uint32_t gid = getGid(pid, tid);
+    ThreadInfo* th = gidMap[gid];
+    futex_unlock(&schedLock);
+    while (true) {
+        int futex_res = syscall(SYS_futex, th->futexWord, FUTEX_WAIT, 1 /*a racing thread waking us up will change value to 0, and we won't block*/, nullptr, nullptr, 0);
+        if (futex_res == 0 || th->futexWord != 1) break;
     }
+    join(pid, tid);
     return true;
 }
 
 bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t tid, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std) {
-    info("Scheduler: FUTEX WAIT called with bitmask %d pi %d pid %u tid %u", bitmask, pi_waiter, pid, tid);
+    DEBUG_FUTEX("Scheduler: FUTEX WAIT called with bitmask %d pi %d pid %u tid %u", bitmask, pi_waiter, pid, tid);
     uint64_t wakeUpPhases = getFutexWakePhase(pi_waiter, fi, ctxt, std);  //pi versions all interpret as realtime
+    uint32_t cid;
     if(wakeUpPhases == 0) {
       wakeUpPhases = 0xffffffff;
     }
@@ -338,50 +341,62 @@ bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t t
     tempWaiter.mask = 0xffffffff; tempWaiter.val = fi.val; tempWaiter.fi = fi; tempWaiter.allow_requeue = !pi_waiter;
     if(!pi_waiter) { //Normal cases
         if(fi.val != *fi.uaddr) {
-            warn("Cur val didn't match val in futex wait");
+            DEBUG_FUTEX("Cur val didn't match val in futex wait");
             return false;
         }
-        info("WAIT took normal path");
+        DEBUG_FUTEX("WAIT took normal path");
         if(bitmask) {
             tempWaiter.mask = fi.val3;
         }
         futexTable[fi.uaddr].push_back(tempWaiter);
-        mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+        markForSleep(pid, tid, wakeUpPhases);
+        futex_lock(&schedLock);
+        cid = gidMap[getGid(pid, tid)]->cid;
+        futex_unlock(&schedLock);
+        leave(pid, tid, cid);
     } else {    //if pi_waiter
         switch (fi.op & FUTEX_CMD_MASK) {
             case FUTEX_LOCK_PI:
-                info("WAIT took lock path");
+                DEBUG_FUTEX("WAIT took lock path");
                 if(futexTable[fi.uaddr].size() == 0) // Check that no one else is in line.
                 {
-                    info("FUTEX_LOCK_PI successfully locked");
+                    DEBUG_FUTEX("FUTEX_LOCK_PI successfully locked");
                     futexTable[fi.uaddr].push_back(tempWaiter); //Notice we don't deschedule
                     return true;
                 } else {
-                  info("LOCK delayed");
+                  DEBUG_FUTEX("LOCK delayed");
                   if(bitmask) {
                       tempWaiter.mask = fi.val3;
                   }
                   futexTable[fi.uaddr].push_back(tempWaiter);
-                  mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+                  markForSleep(pid, tid, wakeUpPhases);
+                  futex_lock(&schedLock);
+                  cid = gidMap[getGid(pid, tid)]->cid;
+                  futex_unlock(&schedLock);
+                  leave(pid, tid, cid);
                 }
                 break;
             case FUTEX_WAIT_REQUEUE_PI:
-                info("WAIT took reque pi path");
+                DEBUG_FUTEX("WAIT took reque pi path");
                 if(fi.val != *fi.uaddr) {
-                    warn("Cur val didn't match val in futex wait");
+                    DEBUG_FUTEX("Cur val didn't match val in futex wait");
                     return false;
                 }
                 tempWaiter.allow_requeue = true;
                 if(bitmask) {
                     tempWaiter.mask = fi.val3;
                 }
-                mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, wakeUpPhases);
+                markForSleep(pid, tid, wakeUpPhases);
+                futex_lock(&schedLock);
+                cid = gidMap[getGid(pid, tid)]->cid;
+                futex_unlock(&schedLock);
+                leave(pid, tid, cid);
                 futexTable[fi.uaddr].push_back(tempWaiter);
                 break;
             case FUTEX_TRYLOCK_PI:
-                info("WAIT took trylock path");
+                DEBUG_FUTEX("WAIT took trylock path");
                 if(futexTable[fi.uaddr].size() == 0) {
-                    info("FUTEX_LOCK_PI successfully locked");
+                    DEBUG_FUTEX("FUTEX_LOCK_PI successfully locked");
                     futexTable[fi.uaddr].push_back(tempWaiter); //Notice we don't deschedule
                     return true;
                 } else {
@@ -396,19 +411,17 @@ bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t t
 }
 
 int Scheduler::futexWake(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
-    info("Scheduler: FUTEX WAKE called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
+    DEBUG_FUTEX("Scheduler: FUTEX WAKE called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
     int bitmaskValue = 0xffffffff;
     if(bitmask) {
         bitmaskValue = fi.val3;
     }
-    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
-    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
     int waitersToWake = futexWakeNWaiters(bitmaskValue, pi_wake, fi.uaddr, fi.val);
     return waitersToWake;
 }
 
 int Scheduler::futexUnlock(bool bitmask, bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
-    info("Scheduler: FUTEX UNLOCK called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
+    DEBUG_FUTEX("Scheduler: FUTEX UNLOCK called with bitmask %d pi %d pid %u tid %u", bitmask, pi_wake, pid, tid);
     //We are responsible for removing the owner. Then we go back to wake.
     if(futexTable[fi.uaddr].size() > 0 && futexTable[fi.uaddr].front().pi_waiter
         && futexTable[fi.uaddr].front().tid == tid  && futexTable[fi.uaddr].front().pid == pid )
@@ -424,10 +437,8 @@ int Scheduler::futexUnlock(bool bitmask, bool pi_wake, uint32_t pid, uint32_t ti
 }
 
 int Scheduler::futexReque(uint32_t pid, uint32_t tid, FutexInfo fi) {
-    info("Scheduler: FUTEX REQUE called with pid %u tid %u", pid, tid);
+    DEBUG_FUTEX("Scheduler: FUTEX REQUE called with pid %u tid %u", pid, tid);
     bool extraWaiters = futexTable[fi.uaddr].size() > (uint32_t)fi.val;
-    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
-    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
     int waitersToWake = futexWakeNWaiters(0xffffffff, false, fi.uaddr, fi.val);
     int extraWaitersToWake = 0;
     if(extraWaiters) {
@@ -437,20 +448,18 @@ int Scheduler::futexReque(uint32_t pid, uint32_t tid, FutexInfo fi) {
 }
 
 int Scheduler::futexCmpReque(bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo fi) {
-    info("Scheduler: FUTEX CMP REQUE called with pi %d pid %u tid %u", pi_wake, pid, tid);
+    DEBUG_FUTEX("Scheduler: FUTEX CMP REQUE called with pi %d pid %u tid %u", pi_wake, pid, tid);
     int *curVal = 0;
     if(!safeCopy(fi.uaddr, curVal)) {
         panic("Futex Wait wasn't able to copy the data.");
     }
     if(fi.val3 != *curVal) {
-        warn("Cur val didn't match val in futex wait");
+        DEBUG_FUTEX("Cur val didn't match val in futex wait");
         return 0;
     }
     bool extraWaiters = futexTable[fi.uaddr].size() > (uint32_t)fi.val;
     int waitersToWake = 0;
     if(!pi_wake) {
-        // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
-        // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
         futexWakeNWaiters(pi_wake, 0xffffffff, fi.uaddr, fi.val);
     }
     int extraWaitersToWake = 0;
@@ -461,7 +470,8 @@ int Scheduler::futexCmpReque(bool pi_wake, uint32_t pid, uint32_t tid, FutexInfo
 }
 //Must be called without lock. Returns # waiters.
 int Scheduler::futexWakeNWaiters(int bitmask, bool p_waiter, int *uaddr, int val) {
-  info("Scheduler: FUTEX WAKE N WAITERS called with bitmask %d pi %d uaddr %p val %d", bitmask, p_waiter, uaddr, val);
+  DEBUG_FUTEX("Scheduler: FUTEX WAKE N WAITERS called with bitmask %d pi %d uaddr %p val %d", bitmask, p_waiter, uaddr, val);
+  futex_lock(&schedLock);
   int waitersToWake = 0;
   int waitersFailed = 0;
   bool piWakeInUserSpace = ((futexTable[uaddr].size() == 1) && futexTable[uaddr].front().pi_waiter);
@@ -472,7 +482,13 @@ int Scheduler::futexWakeNWaiters(int bitmask, bool p_waiter, int *uaddr, int val
             FutexWaiter tempWaiter = futexTable[uaddr][i];
             futexTable[uaddr].erase(futexTable[uaddr].begin() + waitersFailed);
             futexTable[uaddr].push_front(tempWaiter);
-            warn("we had a pi requestor jump to front of line");
+            DEBUG_FUTEX("we had a pi requestor jump to front of line");
+            uint32_t gid = getGid(tempWaiter.pid, tempWaiter.tid);
+            ThreadInfo* th = gidMap[gid];
+            assert(th->state == SLEEPING);
+            notifySleepEnd(tempWaiter.pid, tempWaiter.tid);
+            wakeup(th, true);
+            futex_unlock(&schedLock);
             return 1;
           }
       }
@@ -485,14 +501,22 @@ int Scheduler::futexWakeNWaiters(int bitmask, bool p_waiter, int *uaddr, int val
           waitersToWake++;
           futexTable[uaddr].erase(futexTable[uaddr].begin() + waitersFailed);
       }
+      uint32_t gid = getGid(tempWaiter.pid, tempWaiter.tid);
+      ThreadInfo* th = gidMap[gid];
+      assert(th->state == SLEEPING);
+      notifySleepEnd(tempWaiter.pid, tempWaiter.tid);
+      DEBUG_FUTEX("WAKE N finished sleep end");
+      wakeup(th, true);
+      DEBUG_FUTEX("WAKE N finished wakeup");
   }
-  info("WAKE N WAITERS Looped %d times", waitersFailed + waitersToWake);
+  DEBUG_FUTEX("WAKE N WAITERS Looped %d times", waitersFailed + waitersToWake);
+  futex_unlock(&schedLock);
   return waitersToWake;
 }
 
 //Must be called with lock held. Will not release. Returns # waiters moved.
 int Scheduler::futexMoveNWaiters(bool pi_wake, int *srcUaddr, int *targetUaddr, int val) {
-  info("Scheduler: FUTEX MOVE N WAITERS called with pi %d src %p targ %p val %d", pi_wake, srcUaddr, targetUaddr, val);
+  DEBUG_FUTEX("Scheduler: FUTEX MOVE N WAITERS called with pi %d src %p targ %p val %d", pi_wake, srcUaddr, targetUaddr, val);
   int waitersToMove = 0;
   int waitersFailed = 0;
   while((uint32_t)waitersToMove < futexTable[srcUaddr].size() && waitersToMove < val) {
@@ -515,17 +539,13 @@ int Scheduler::futexMoveNWaiters(bool pi_wake, int *srcUaddr, int *targetUaddr, 
 }
 
 int Scheduler::futexWakeOp(uint32_t pid, uint32_t tid, FutexInfo fi) {
-    info("Scheduler: FUTEX WAKE OP called with pid %u tid %u", pid, tid);
-    //From the man page
-    //  int oldval = *(int *) uaddr2;
-    int *oldVal = 0;
+    DEBUG_FUTEX("Scheduler: FUTEX WAKE OP called with pid %u tid %u", pid, tid);
+    int *oldVal = 0; //  int oldval = *(int *) uaddr2;
     if(!safeCopy(fi.uaddr2, oldVal)) {
         panic("Futex Wake Op wasn't able to copy the data.");
     }
-    //val3 contains
     // |op |cmp|   oparg   |  cmparg   |
     //   4   4       12          12    <== # of bits
-    // #define FUTEX_OP(op, oparg, cmp, cmparg)
     int op = (fi.val3 & 0xf) >> 28;      // (((op & 0xf) << 28) |
     int cmp = (fi.val3 & 0xf) >> 24;     // ((cmp & 0xf) << 24) |
     int oparg = (fi.val3 & 0xfff) >> 12; // ((oparg & 0xfff) << 12) |
@@ -533,8 +553,7 @@ int Scheduler::futexWakeOp(uint32_t pid, uint32_t tid, FutexInfo fi) {
     // Bit-wise ORing the following value into op causes
     // (1 << oparg) to be used as the operand: FUTEX_OP_ARG_SHIFT  8
     if(op & 8) { oparg = 1 << oparg; }
-    int *newVal; *newVal = 0;
-    //  *(int *) uaddr2 = oldval op oparg;
+    int *newVal; *newVal = 0; //  *(int *) uaddr2 = oldval op oparg;
     switch (op) { //Op is defined as:
       case 0: // FUTEX_OP_SET        0  /* uaddr2 = oparg; */
           *newVal = oparg;
@@ -549,9 +568,6 @@ int Scheduler::futexWakeOp(uint32_t pid, uint32_t tid, FutexInfo fi) {
       default:
           panic("We are missing an op type in sched wake op");
     }
-    //  futex(uaddr, FUTEX_WAKE, val, 0, 0, 0);
-    // leave(pid, tid, gidMap[getGid(pid, tid)]->cid);
-    // mattsReasonableSyscallLeave(pid, tid, gidMap[getGid(pid, tid)]->cid, 2);
     int waitersToWake = futexWakeNWaiters(false, 0xffffffff, fi.uaddr, fi.val);
     bool cmpResult = false;
     switch (cmp) { // The cmp field is one of the following:
@@ -600,4 +616,3 @@ void Scheduler::waitUntilQueued(ThreadInfo* th) {
         }
     }
 }
-

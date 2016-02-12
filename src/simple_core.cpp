@@ -93,28 +93,50 @@ InstrFuncPtrs SimpleCore::GetFuncPtrs() {
 }
 
 void SimpleCore::LoadFunc(THREADID tid, ADDRINT addr) {
-    static_cast<SimpleCore*>(cores[tid])->load(addr);
+    //static_cast<SimpleCore*>(cores[tid])->load(addr);
+    static_cast<SimpleCore*>(cores[tid])->curCycle = static_cast<SimpleCore*>(cores[tid])->l1d->load(addr, static_cast<SimpleCore*>(cores[tid])->curCycle);
 }
 
 void SimpleCore::StoreFunc(THREADID tid, ADDRINT addr) {
-    static_cast<SimpleCore*>(cores[tid])->store(addr);
+    //static_cast<SimpleCore*>(cores[tid])->store(addr);
+    static_cast<SimpleCore*>(cores[tid])->curCycle = static_cast<SimpleCore*>(cores[tid])->l1d->store(addr, static_cast<SimpleCore*>(cores[tid])->curCycle);    
 }
 
 void SimpleCore::PredLoadFunc(THREADID tid, ADDRINT addr, BOOL pred) {
-    if (pred) static_cast<SimpleCore*>(cores[tid])->load(addr);
+    //if (pred) static_cast<SimpleCore*>(cores[tid])->load(addr);
+    static_cast<SimpleCore*>(cores[tid])->curCycle = static_cast<SimpleCore*>(cores[tid])->l1d->load(addr, static_cast<SimpleCore*>(cores[tid])->curCycle);
 }
 
 void SimpleCore::PredStoreFunc(THREADID tid, ADDRINT addr, BOOL pred) {
-    if (pred) static_cast<SimpleCore*>(cores[tid])->store(addr);
+    //if (pred) static_cast<SimpleCore*>(cores[tid])->store(addr);
+    static_cast<SimpleCore*>(cores[tid])->curCycle = static_cast<SimpleCore*>(cores[tid])->l1d->store(addr, static_cast<SimpleCore*>(cores[tid])->curCycle);
 }
 
 void SimpleCore::BblFunc(THREADID tid, ADDRINT bblAddr, BblInfo* bblInfo) {
-    SimpleCore* core = static_cast<SimpleCore*>(cores[tid]);
-    core->bbl(bblAddr, bblInfo);
+    //SimpleCore* core = static_cast<SimpleCore*>(cores[tid]);
+    //core->bbl(bblAddr, bblInfo);
+    //
+    //while (core->curCycle > core->phaseEndCycle) {
+    //    assert(core->phaseEndCycle == zinfo->globPhaseCycles + zinfo->phaseLength);
+    //    core->phaseEndCycle += zinfo->phaseLength;
+    //
+    //    uint32_t cid = getCid(tid);
+    //    //NOTE: TakeBarrier may take ownership of the core, and so it will be used by some other thread. If TakeBarrier context-switches us,
+    //    //the *only* safe option is to return inmmediately after we detect this, or we can race and corrupt core state. If newCid == cid,
+    //    //we're not at risk of racing, even if we were switched out and then switched in.
+    //    uint32_t newCid = TakeBarrier(tid, cid);
+    //    if (newCid != cid) break; /*context-switch*/
+    //}
+    static_cast<SimpleCore*>(cores[tid])->instrs += bblInfo->instrs;
+    static_cast<SimpleCore*>(cores[tid])->curCycle += bblInfo->instrs;
+    Address endBblAddr = bblAddr + bblInfo->bytes;
+    for (Address fetchAddr = bblAddr; fetchAddr < endBblAddr; fetchAddr+=(1 << lineBits)) {
+        static_cast<SimpleCore*>(cores[tid])->curCycle
+          = static_cast<SimpleCore*>(cores[tid])->l1i->load(fetchAddr, static_cast<SimpleCore*>(cores[tid])->curCycle);
+    }
 
-    while (core->curCycle > core->phaseEndCycle) {
-        assert(core->phaseEndCycle == zinfo->globPhaseCycles + zinfo->phaseLength);
-        core->phaseEndCycle += zinfo->phaseLength;
+    while (static_cast<SimpleCore*>(cores[tid])->curCycle > static_cast<SimpleCore*>(cores[tid])->phaseEndCycle) {
+        static_cast<SimpleCore*>(cores[tid])->phaseEndCycle += (zinfo->globPhaseCycles - static_cast<SimpleCore*>(cores[tid])->phaseEndCycle) + zinfo->phaseLength;
 
         uint32_t cid = getCid(tid);
         //NOTE: TakeBarrier may take ownership of the core, and so it will be used by some other thread. If TakeBarrier context-switches us,
@@ -123,5 +145,6 @@ void SimpleCore::BblFunc(THREADID tid, ADDRINT bblAddr, BblInfo* bblInfo) {
         uint32_t newCid = TakeBarrier(tid, cid);
         if (newCid != cid) break; /*context-switch*/
     }
+
 }
 

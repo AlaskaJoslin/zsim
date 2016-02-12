@@ -59,15 +59,10 @@ static int getTimeoutArg(int syscallNum) {
 static Scheduler::FutexInfo getFilledInFutex(uint32_t tid, CONTEXT* ctxt, SYSCALL_STANDARD std) {
     Scheduler::FutexInfo fi;
     fi.uaddr = (int*) PIN_GetSyscallArgument(ctxt, std, 0);
-    info("uaddr: %p %i", fi.uaddr, *(fi.uaddr));
     fi.op = (int) PIN_GetSyscallArgument(ctxt, std, 1);
-    info("op: %i", fi.op);
     fi.val = (int) PIN_GetSyscallArgument(ctxt, std, 2);
-    info("val: %i", fi.val);
     fi.uaddr2 = (int*) PIN_GetSyscallArgument(ctxt, std, 4);
-    info("uaddr2: %p", fi.uaddr2);
     fi.val3 = (uint32_t) PIN_GetSyscallArgument(ctxt, std, 5);
-    info("val3: %i", fi.val3);
     switch (fi.op & FUTEX_CMD_MASK) {
         case FUTEX_REQUEUE:
             info("FUTEX_REQUE");
@@ -116,8 +111,7 @@ static Scheduler::FutexInfo getFilledInFutex(uint32_t tid, CONTEXT* ctxt, SYSCAL
         case FUTEX_WAIT_REQUEUE_PI:
             fi.val2 = 0;
             const struct timespec* timeout = (const struct timespec*) PIN_GetSyscallArgument(ctxt, std, 3);
-            if(timeout)
-            {
+            if(timeout) {
               fi.timeout = *timeout;
             }
             break;
@@ -228,50 +222,6 @@ PostPatchFn PatchTimeoutSyscall(PrePatchArgs args) {
                     fi.retValue = 0;
                 }
                 break;
-            case FUTEX_WAKE:
-                //  Wakes at most val of waiters on uaddr. No guarantee on priority.
-                // Returns the number of waiters that were woken up.
-                fi.retValue = zinfo->sched->futexWake(false, false, procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_FD: //  definitely panic. This operation hasn't been supported since Linux 2.6.something
-                panic("We don't support FUTEX_FD.");
-            case FUTEX_REQUEUE: //  Same as FUTEX_CMP_REQUEUE without the comparison.
-                fi.retValue = zinfo->sched->futexReque(procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_CMP_REQUEUE:
-                //  Checks that uaddr still contains val3. If not return EAGAIN.
-                //  Otherwise wake up at most val waiters. If waiters > val, then
-                //  at most val2 of the remaining waiters are removed from
-                //  uaddr's queue and placed in uaddr2's queue.
-                fi.retValue = zinfo->sched->futexCmpReque(false, procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_WAKE_OP:
-                zinfo->sched->futexWakeOp(procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_WAKE_BITSET:
-                //  Like FUTEX_WAKE except val3 is used as a bitwise & of the values
-                //  stored from FUTEX_WAIT_BITSET. Normal WAIT and WAKE functions have
-                //  bit masks of all 1s.
-                fi.retValue = zinfo->sched->futexWake(true, false, procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_UNLOCK_PI:
-                // This operation wakes the top priority waiter that is waiting
-                // in FUTEX_LOCK_PI on the futex address provided by the uaddr argument.
-                fi.retValue = zinfo->sched->futexUnlock(false, true, procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            case FUTEX_CMP_REQUEUE_PI:
-                // This operation is a PI-aware variant of FUTEX_CMP_REQUEUE.
-                fi.retValue = zinfo->sched->futexCmpReque(true, procIdx, args.tid, fi);
-                // zinfo->sched->leave(procIdx, args.tid, getCid(args.tid));
-                break;
-            default:
-                panic("We are missing a case for futex.");
         }
         info("Finished futex syscall with return value: %i", fi.retValue);
         threadBlockingInfo[args.tid].retValue = fi.retValue;
@@ -287,19 +237,51 @@ PostPatchFn PatchTimeoutSyscall(PrePatchArgs args) {
               case FUTEX_WAIT_BITSET:
               case FUTEX_LOCK_PI:
               case FUTEX_WAIT_REQUEUE_PI:
-              if(threadBlockingInfo[args.tid].retValue == 0) {  //We suceeded
+                  if(PIN_GetSyscallReturn(args.ctxt, args.std) == 0) {  //We suceeded
                       info("Thread tid %d saw a matching actual wake", args.tid);
-                      zinfo->sched->syscallJoin(procIdx, args.tid);
-                      // zinfo->sched->sync(procIdx, args.tid, getCid(args.tid));
+                      zinfo->sched->futexSynchronized(procIdx, args.tid, threadBlockingInfo[args.tid].fi);
+                      info("Wait finished futex synch");
                   } else {
                       info("Thread tid %d failed", args.tid);
                   }
                   break;
+              case FUTEX_WAKE:
+                //  Wakes at most val of waiters on uaddr. No guarantee on priority.
+                // Returns the number of waiters that were woken up.
+                fi.retValue = zinfo->sched->futexWake(false, false, procIdx, args.tid, fi);
+                break;
+              case FUTEX_FD: //  definitely panic. This operation hasn't been supported since Linux 2.6.something
+                panic("We don't support FUTEX_FD.");
+              case FUTEX_REQUEUE: //  Same as FUTEX_CMP_REQUEUE without the comparison.
+                fi.retValue = zinfo->sched->futexReque(procIdx, args.tid, fi);
+                break;
+              case FUTEX_CMP_REQUEUE:
+                //  Checks that uaddr still contains val3. If not return EAGAIN.
+                //  Otherwise wake up at most val waiters. If waiters > val, then
+                //  at most val2 of the remaining waiters are removed from
+                //  uaddr's queue and placed in uaddr2's queue.
+                fi.retValue = zinfo->sched->futexCmpReque(false, procIdx, args.tid, fi);
+                break;
+              case FUTEX_WAKE_OP:
+                zinfo->sched->futexWakeOp(procIdx, args.tid, fi);
+                break;
+              case FUTEX_WAKE_BITSET:
+                //  Like FUTEX_WAKE except val3 is used as a bitwise & of the values
+                //  stored from FUTEX_WAIT_BITSET. Normal WAIT and WAKE functions have
+                //  bit masks of all 1s.
+                fi.retValue = zinfo->sched->futexWake(true, false, procIdx, args.tid, fi);
+                break;
+              case FUTEX_UNLOCK_PI:
+                // This operation wakes the top priority waiter that is waiting
+                // in FUTEX_LOCK_PI on the futex address provided by the uaddr argument.
+                fi.retValue = zinfo->sched->futexUnlock(false, true, procIdx, args.tid, fi);
+                break;
+              case FUTEX_CMP_REQUEUE_PI:
+                // This operation is a PI-aware variant of FUTEX_CMP_REQUEUE.
+                fi.retValue = zinfo->sched->futexCmpReque(true, procIdx, args.tid, fi);
+                break;
               default:
-                  // zinfo->sched->join(procIdx, args.tid);
-                  // zinfo->sched->syscallJoin(procIdx, args.tid);
-                  // zinfo->sched->sync(procIdx, args.tid, getCid(args.tid));
-                  info("Thread tid %d was a wake and returned with %d", args.tid, threadBlockingInfo[args.tid].fi.retValue);
+                panic("We are missing a case for futex.");
           }
           return NullPostPatch;
       }

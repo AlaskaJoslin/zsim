@@ -295,39 +295,6 @@ class Scheduler : public GlobAlloc, public Callee {
             futex_unlock(&schedLock);
         }
 
-        //This function should block until it is actually scheduled
-        uint32_t syscallJoin(uint32_t pid, uint32_t tid) {
-            futex_lock(&schedLock);
-            info("syscallJoin called on tid %d", tid);
-            uint32_t gid = getGid(pid, tid);
-            ThreadInfo* th = gidMap[gid];
-            assert(th->markedForSleep == false);
-            assert(th->state == SLEEPING);
-            sleepQueue.remove(th);
-            th->state = BLOCKED;
-            // If we're in a fake leave, something is wrong.
-            if (th->fakeLeave) {
-                panic("fake leave in join tid %d", tid);
-            }
-            ContextInfo* ctx = schedThread(th);
-            if (ctx) {
-                schedule(th, ctx);
-                info("SyscallJoin: Schedule successful");
-                zinfo->cores[th->cid]->join();
-                info("SyscallJoin: Core Join successful");
-                bar.join(th->cid, &schedLock); //releases lock
-                info("SyscallJoin: Barrier Join successful");
-            } else {
-                th->state = QUEUED;
-                runQueue.push_back(th);
-                waitForContext(th); //releases lock, might join
-            }
-            ThreadInfo* thTest = contexts[th->cid].curThread;
-            if(!thTest) { panic("Thread %u has been descheduled inappropriately.", tid); }
-            info("returned from syscall join");
-            return th->cid;
-        }
-
         uint32_t join(uint32_t pid, uint32_t tid) {
             futex_lock(&schedLock);
             //If leave was in this phase, call bar.join()
@@ -376,54 +343,6 @@ class Scheduler : public GlobAlloc, public Callee {
             }
 
             return th->cid;
-        }
-
-        //This cannot block.
-        volatile uint32_t* mattsReasonableSyscallLeave(uint32_t pid, uint32_t tid, uint32_t cid, uint64_t wakeupPhase) {
-            futex_lock(&schedLock);
-            //Extracted from mark for sleep.
-            uint32_t gid = getGid(pid, tid);
-            ThreadInfo* th = contexts[cid].curThread;
-            //Error checking.
-            if(!th) { panic("Thread %u has been descheduled inappropriately.", tid); }
-            assert(!th->markedForSleep);
-            assert(th->gid == gid);
-            assert(th->state == RUNNING);
-            //Actual sleep actions
-            if(wakeupPhase < curPhase) wakeupPhase += curPhase;
-            th->wakeupPhase = wakeupPhase;
-            th->futexWord = 1; //to avoid races, this must be set here.
-            //Extracted from leave.
-            zinfo->cores[cid]->leave(); //Eventually we will do this but this thread
-            //is in the middle of a bbl and we will lose the bbl state info. Mostly
-            //important for non-simple cores.
-            info("Matts Syscall Leave called on tid %u and cid %u", tid, cid);
-            th->markedForSleep = false;
-            ContextInfo* ctx = &contexts[cid];
-            deschedule(th, ctx, SLEEPING);
-            //Ordered insert into sleepQueue
-            if (sleepQueue.empty() || sleepQueue.front()->wakeupPhase > th->wakeupPhase) {
-                sleepQueue.push_front(th);
-            } else {
-                ThreadInfo* cur = sleepQueue.front();
-                while (cur->next && cur->next->wakeupPhase <= th->wakeupPhase) {
-                    cur = cur->next;
-                }
-                sleepQueue.insertAfter(cur, th);
-            }
-            sleepEvents.inc();
-            ThreadInfo* inTh = schedContext(ctx);
-            if (inTh) {
-                warn("LEAVE was able to fill context with pid %u tid %u", getPid(inTh->gid), getTid(inTh->gid));
-                schedule(inTh, ctx);
-                zinfo->cores[ctx->cid]->join(); //inTh does not do a sched->join, so we need to notify the core since we just called leave() on it
-                wakeup(inTh, false /*no join, we did not leave*/);
-            } else {
-                freeList.push_back(ctx);
-                bar.leave(cid); //may trigger end of phase
-            }
-            futex_unlock(&schedLock);
-            return &(th->futexWord);
         }
 
         void leave(uint32_t pid, uint32_t tid, uint32_t cid) {

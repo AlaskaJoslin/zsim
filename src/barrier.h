@@ -121,16 +121,6 @@ class Barrier : public GlobAlloc {
         }
 
         ~Barrier() {}
-        int notAtBarrier() {
-            //returns the number of threads not at the barrier.
-            int threadsAt = 0;
-            for (uint32_t i = runListSize; i > 0; i--) {
-                if ((threadList[i].futexWord == 1 && threadList[i].state == WAITING) || threadList[i].state == LEFT) {
-                    threadsAt++;
-                }
-            }
-            return runListSize - threadsAt;
-        }
 
         //Called with schedLock held; returns with schedLock unheld
         void join(uint32_t tid, lock_t* schedLock) {
@@ -163,7 +153,6 @@ class Barrier : public GlobAlloc {
                     info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!TID %u is still running", i);
                 }
             }
-            info("TID %d is about try to wake next, running threads is %d", tid, runningThreads);
             tryWakeNext(tid); //NOTE: You can't cause a phase to end here.
             futex_unlock(schedLock);
 
@@ -192,7 +181,6 @@ class Barrier : public GlobAlloc {
                 assert_msg(threadList[tid].state == WAITING, "leave, tid %d, incorrect state %d", tid, threadList[tid].state);
                 threadList[tid].state = LEFT;
                 leftThreads++;
-                warn("!!!!!!!!!!!!!!!!!!!!!Should we have decreased runningThreads");
             }
         }
 
@@ -203,7 +191,6 @@ class Barrier : public GlobAlloc {
             threadList[tid].futexWord = 1;
             threadList[tid].state = WAITING;
             runningThreads--;
-            info("TID %d is about try to wake next, running threads is %d", tid, runningThreads);
             for (uint32_t i = runListSize; i > 0; i--) {
                 if (!((threadList[i].futexWord == 1 && threadList[i].state == WAITING) || threadList[i].state == LEFT)) {
                     info("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!TID %u is still running", i);
