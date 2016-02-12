@@ -333,7 +333,9 @@ bool Scheduler::futexSynchronized(uint32_t pid, uint32_t tid, FutexInfo fi) {
 bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t tid, FutexInfo fi, CONTEXT* ctxt, SYSCALL_STANDARD std) {
     DEBUG_FUTEX("Scheduler: FUTEX WAIT called with bitmask %d pi %d pid %u tid %u", bitmask, pi_waiter, pid, tid);
     uint64_t wakeUpPhases = getFutexWakePhase(pi_waiter, fi, ctxt, std);  //pi versions all interpret as realtime
-    uint32_t cid;
+    futex_lock(&schedLock);
+    uint32_t cid = gidMap[getGid(pid, tid)]->cid;
+    futex_unlock(&schedLock);
     if(wakeUpPhases == 0) {
       wakeUpPhases = 0xffffffff;
     }
@@ -350,9 +352,6 @@ bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t t
         }
         futexTable[fi.uaddr].push_back(tempWaiter);
         markForSleep(pid, tid, wakeUpPhases);
-        futex_lock(&schedLock);
-        cid = gidMap[getGid(pid, tid)]->cid;
-        futex_unlock(&schedLock);
         leave(pid, tid, cid);
     } else {    //if pi_waiter
         switch (fi.op & FUTEX_CMD_MASK) {
@@ -370,9 +369,6 @@ bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t t
                   }
                   futexTable[fi.uaddr].push_back(tempWaiter);
                   markForSleep(pid, tid, wakeUpPhases);
-                  futex_lock(&schedLock);
-                  cid = gidMap[getGid(pid, tid)]->cid;
-                  futex_unlock(&schedLock);
                   leave(pid, tid, cid);
                 }
                 break;
@@ -387,9 +383,6 @@ bool Scheduler::futexWait(bool bitmask, bool pi_waiter, uint32_t pid, uint32_t t
                     tempWaiter.mask = fi.val3;
                 }
                 markForSleep(pid, tid, wakeUpPhases);
-                futex_lock(&schedLock);
-                cid = gidMap[getGid(pid, tid)]->cid;
-                futex_unlock(&schedLock);
                 leave(pid, tid, cid);
                 futexTable[fi.uaddr].push_back(tempWaiter);
                 break;
